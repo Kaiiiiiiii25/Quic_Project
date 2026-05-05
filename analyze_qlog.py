@@ -71,31 +71,23 @@ class Trace:
 def _iter_events(qlog_path: str):
     """yield (relative_time_ms, name, data) for each event.
 
-    aioquic 的 qlog 是 NDJSON：第一行是 header（含 trace metadata），
-    後面每行是一個 event。
+    aioquic 產生 qlog format=0.3：整檔是一個 JSON document，
+      {"qlog_format": "JSON", "qlog_version": "0.3",
+       "traces": [{"common_fields": {...}, "events": [...]}]}
+    舊版 NDJSON 也支援（每行一個 event）。
     """
     with open(qlog_path, "r") as f:
-        first = f.readline().strip()
-        if not first:
-            return
+        content = f.read()
 
-        # 兩種可能格式：
-        # (a) 第一行就是完整 trace JSON（單檔模式）— 整檔是個 dict
-        # (b) NDJSON：第一行 header、後面 events
-        try:
-            obj = json.loads(first)
-        except json.JSONDecodeError:
-            return
+    if not content.strip():
+        return
 
-        # 判斷是否 NDJSON
-        if "events" in obj and isinstance(obj["events"], list):
-            # 單檔 JSON：整個 trace 已經在第一行
-            for ev in obj["events"]:
-                yield _parse_event(ev)
-            return
-
-        # NDJSON：第一行是 header，剩下逐行讀
-        for line in f:
+    # 嘗試當作完整 JSON 解析（aioquic 0.3 格式）
+    try:
+        obj = json.loads(content)
+    except json.JSONDecodeError:
+        # NDJSON fallback — 每行一個 event
+        for line in content.splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -103,6 +95,19 @@ def _iter_events(qlog_path: str):
                 ev = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            yield _parse_event(ev)
+        return
+
+    # qlog 0.3：events 在 traces[0].events
+    traces = obj.get("traces") or []
+    for trace in traces:
+        for ev in trace.get("events", []):
+            yield _parse_event(ev)
+        return  # 只處理第一個 trace
+
+    # 退路：頂層直接有 events（很罕見的格式）
+    if "events" in obj and isinstance(obj["events"], list):
+        for ev in obj["events"]:
             yield _parse_event(ev)
 
 
@@ -141,15 +146,18 @@ def parse_qlog(path: str, name: Optional[str] = None) -> Trace:
 
         # cwnd / rtt 都從 metrics_updated 來
         if ename.endswith(":metrics_updated") or ename == "metrics_updated":
-            if "congestion_window" in data:
+            # aioquic 0.3 用 "cwnd"；舊版/其他實作可能用 "congestion_window"
+            cw = data.get("cwnd", data.get("congestion_window"))
+            if cw is not None:
                 tr.t_cwnd.append(rel_ms)
-                tr.cwnd.append(float(data["congestion_window"]))
+                tr.cwnd.append(float(cw))
             if "ssthresh" in data:
                 tr.t_ssthresh.append(rel_ms)
                 tr.ssthresh.append(float(data["ssthresh"]))
-            if "smoothed_rtt" in data:
+            srtt = data.get("smoothed_rtt", data.get("latest_rtt"))
+            if srtt is not None:
                 tr.t_rtt.append(rel_ms)
-                tr.smoothed_rtt.append(float(data["smoothed_rtt"]))
+                tr.smoothed_rtt.append(float(srtt))
 
         # sent / received bytes (拿 raw.length 或 header.packet_size)
         elif ename.endswith(":packet_sent") or ename == "packet_sent":
