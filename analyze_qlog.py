@@ -217,21 +217,31 @@ def merge_traces(traces: list[Trace], label: str) -> Trace:
 # -------------------------------------------------------------------
 
 def compute_throughput(t_ms: list[float], cum_bytes: list[int],
-                       window_ms: float = 200) -> tuple[list[float], list[float]]:
-    """從累積 bytes 算出滑動窗口的瞬時吞吐量 (Mbps)。"""
+                       window_ms: float = 200,
+                       min_window_ms: float = 50,
+                       min_bytes: int = 50_000) -> tuple[list[float], list[float]]:
+    """從累積 bytes 算出滑動窗口的瞬時吞吐量 (Mbps)。
+
+    為避免起始的「短窗口大數值」尖峰，要求每個窗口至少要有
+      - min_window_ms 毫秒的時間跨度，或者
+      - min_bytes 個 bytes 的樣本量
+    都不滿足就跳過該點。
+    """
     if not t_ms:
         return [], []
     out_t, out_v = [], []
     j = 0
     for i in range(len(t_ms)):
-        # 找出 t[i] - window_ms 之後的最早索引
         while j < i and t_ms[i] - t_ms[j] > window_ms:
             j += 1
-        dt = (t_ms[i] - t_ms[j]) / 1000.0  # 秒
-        if dt <= 0:
-            continue
+        dt_ms = t_ms[i] - t_ms[j]
         dB = cum_bytes[i] - cum_bytes[j]
-        mbps = (dB * 8) / dt / 1_000_000
+        # 過濾「窗口太短或樣本太少」的點，避免假尖峰
+        if dt_ms < min_window_ms and dB < min_bytes:
+            continue
+        if dt_ms <= 0:
+            continue
+        mbps = (dB * 8) / (dt_ms / 1000.0) / 1_000_000
         out_t.append(t_ms[i])
         out_v.append(mbps)
     return out_t, out_v
@@ -279,10 +289,18 @@ def plot_compare(traces: list[Trace], output: str = "compare.png",
             cwnd_kb = [v / 1024 for v in tr.cwnd]
             ax_cwnd.plot(tr.t_cwnd, cwnd_kb, color=c, label=tr.name,
                          linewidth=1.4, alpha=0.9)
-            # loss 點（用半透明垂直線標）
-            if tr.t_loss:
-                for tl in tr.t_loss:
-                    ax_cwnd.axvline(tl, color=c, alpha=0.06, linewidth=0.5)
+            # loss 用稀疏的 × 標在曲線上（取樣到最多 30 個避免太密）
+            if tr.t_loss and tr.t_cwnd:
+                # 為每個 loss 時間點找最接近的 cwnd 值來定位 y
+                import bisect
+                stride = max(1, len(tr.t_loss) // 30)
+                for k in range(0, len(tr.t_loss), stride):
+                    tl = tr.t_loss[k]
+                    j = bisect.bisect_left(tr.t_cwnd, tl)
+                    j = min(j, len(tr.cwnd) - 1)
+                    ax_cwnd.scatter([tl], [tr.cwnd[j] / 1024],
+                                    color=c, marker="x", s=22,
+                                    linewidths=1.0, zorder=5)
 
         # 2) throughput
         # 優先用 sent (server qlog) 否則用 recv (client qlog)
